@@ -1,0 +1,7 @@
+canvas-data/
+.venv/
+.test-tmp/
+.test-data/
+__pycache__/
+*.py[cod]
+*.egg-info/

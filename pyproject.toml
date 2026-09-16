@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canvas-course-rag"
+version = "0.1.0"
+description = "Local Canvas course archive and semantic search"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+browser = ["playwright>=1.50"]
+rag = ["lancedb>=0.20", "sentence-transformers>=3.4"]
+documents = ["pypdf>=5", "python-docx>=1.1", "python-pptx>=1.0", "openpyxl>=3.1"]
+all = ["playwright>=1.50", "lancedb>=0.20", "sentence-transformers>=3.4", "pypdf>=5", "python-docx>=1.1", "python-pptx>=1.0", "openpyxl>=3.1"]
+
+[project.scripts]
+course-rag = "canvas_rag.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["canvas_rag*"]
