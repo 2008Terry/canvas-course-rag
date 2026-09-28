@@ -250,6 +250,15 @@ def _local_time(value: str | None) -> str:
         return value
 
 
+def lock_text(value) -> str:
+    """Canvas lock explanations are HTML snippets; keep only their readable text."""
+    if not value:
+        return ""
+    text = re.sub(r"<(script|style)\b.*?</\1>", " ", str(value), flags=re.S | re.I)
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _esc(value) -> str:
     return html.escape(" ".join(str(value).split()) if value is not None else "")
 
@@ -439,12 +448,12 @@ class CourseCollector:
         meta = _meta_list([
             ("Page", "front page" if page.get("front_page") else ""),
             ("Updated", _local_time(page.get("updated_at"))),
-            ("Locked", page.get("lock_explanation") if page.get("locked_for_user") else ""),
+            ("Locked", lock_text(page.get("lock_explanation")) if page.get("locked_for_user") else ""),
         ])
         if not body.strip() and not page.get("locked_for_user"):
             if "body" not in page:
                 return
-        text = body if body.strip() else f"<p>{_esc(page.get('lock_explanation') or 'This page has no content.')}</p>"
+        text = body if body.strip() else f"<p>{_esc(lock_text(page.get('lock_explanation')) or 'This page has no content.')}</p>"
         self.add_doc(url, page.get("title") or slug, f"<h1>{_esc(page.get('title') or slug)}</h1>{meta}{text}", "page")
         if page.get("page_id"):
             self.content.aliases[self.course_url(f"/pages/{page['page_id']}")] = url
@@ -461,7 +470,7 @@ class CourseCollector:
             ("Allowed attempts", "unlimited" if quiz.get("allowed_attempts") == -1 else quiz.get("allowed_attempts")),
             ("Due", _local_time(quiz.get("due_at"))), ("Available from", _local_time(quiz.get("unlock_at"))),
             ("Available until", _local_time(quiz.get("lock_at"))),
-            ("Locked", quiz.get("lock_explanation") if quiz.get("locked_for_user") else ""),
+            ("Locked", lock_text(quiz.get("lock_explanation")) if quiz.get("locked_for_user") else ""),
         ])
         self.add_doc(url, quiz.get("title") or url, f"<h1>{_esc(quiz.get('title'))}</h1>{meta}{description}", "quiz")
         self.scan_html(description, f"quiz:{quiz.get('title')}")
@@ -483,7 +492,7 @@ class CourseCollector:
             ("External tool", urlsplit(tool).netloc if tool else ""),
             ("Available from", _local_time(assignment.get("unlock_at"))),
             ("Available until", _local_time(assignment.get("lock_at"))),
-            ("Locked", assignment.get("lock_explanation") if assignment.get("locked_for_user") else ""),
+            ("Locked", lock_text(assignment.get("lock_explanation")) if assignment.get("locked_for_user") else ""),
         ])
         body = f"<h1>{_esc(assignment.get('name'))}</h1>{meta}"
         body += description if description.strip() else "<p>No description on Canvas.</p>"
@@ -618,7 +627,7 @@ class CourseCollector:
 
     def _locked_stub(self, url: str, item: dict, kind: str) -> None:
         details = item.get("content_details") or {}
-        explanation = details.get("lock_explanation") or ("Locked for you on Canvas." if details.get("locked_for_user") else "Not available to you through Canvas.")
+        explanation = lock_text(details.get("lock_explanation")) or ("Locked for you on Canvas." if details.get("locked_for_user") else "Not available to you through Canvas.")
         meta = _meta_list([("Module item", kind), ("Due", _local_time(details.get("due_at"))),
                            ("Available from", _local_time(details.get("unlock_at"))), ("Points", details.get("points_possible"))])
         self.add_doc(url, item.get("title") or url, f"<h1>{_esc(item.get('title'))}</h1>{meta}<p>{_esc(explanation)}</p>", kind)

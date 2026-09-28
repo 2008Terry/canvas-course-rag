@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from .archive import page_file_stem, safe_component, save_page, write_course_index
-from .canvas_api import CanvasAPI, CourseCollector, SessionExpiredError, is_media_file
+from .canvas_api import CanvasAPI, CourseCollector, SessionExpiredError, is_media_file, lock_text
 from .catalog import Catalog
 from .extract import extract_attachment_text, html_to_markdown
 from .urls import (
@@ -427,7 +427,7 @@ async def _download_attachment(
     if is_media_file(name=name, content_type=content_type, url=download_url) or meta.get("media_entry_id") and content_type.startswith(("video/", "audio/")):
         return skip("video", media_reason("video", content_type or Path(name).suffix or "media link"))
     if meta.get("locked_for_user"):
-        return skip("locked", meta.get("lock_explanation") or "file is locked for you on Canvas")
+        return skip("locked", lock_text(meta.get("lock_explanation")) or "file is locked for you on Canvas")
     if size is not None and size > MAX_ATTACHMENT_BYTES:
         return skip("too-large", f"larger than 200 MB ({size} bytes)")
 

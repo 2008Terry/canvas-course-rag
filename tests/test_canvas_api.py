@@ -7,7 +7,7 @@ from canvas_rag.browser import (
     EmptyPageError, _FailureLog, _PageLoader, _SkipLog, _download_attachment, is_course_page_url, is_junk_course_url,
     looks_like_shell,
 )
-from canvas_rag.canvas_api import CanvasAPI, CourseCollector, is_media_file, next_link, parse_json_body
+from canvas_rag.canvas_api import CanvasAPI, CourseCollector, is_media_file, lock_text, next_link, parse_json_body
 from canvas_rag.catalog import Catalog
 
 
@@ -29,6 +29,15 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(is_media_file(content_type="audio/x-m4a"))
         self.assertTrue(is_media_file(url="https://aakaf.mivideo.it.umich.edu/media/x"))
         self.assertFalse(is_media_file(name="notes.pdf", content_type="application/pdf"))
+
+    def test_lock_explanation_html_becomes_plain_text(self):
+        raw = ('This page is part of the module <b>Spanish Placement Exam</b> and hasn&#39;t been unlocked yet.'
+               '<br><div class="spinner"></div><a href="/courses/1/modules#module_2" class="module_prerequisites_fallback">'
+               'Visit the modules page for information on how to unlock this content.</a>'
+               '<script>ignored()</script>')
+        self.assertEqual(lock_text(raw), "This page is part of the module Spanish Placement Exam and hasn't been unlocked "
+                                         "yet. Visit the modules page for information on how to unlock this content.")
+        self.assertEqual(lock_text(None), "")
 
     def test_junk_and_scope_filters(self):
         origin = ORIGIN
