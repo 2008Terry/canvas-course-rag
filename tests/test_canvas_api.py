@@ -93,14 +93,18 @@ class CollectTests(unittest.TestCase):
             f"{ORIGIN}/api/v1/courses/12/pages": FakeResponse(text='[{"url":"home","title":"Home","body":"<p>Welcome</p>","front_page":true,"updated_at":"2026-01-01T00:00:00Z"}]'),
             f"{ORIGIN}/api/v1/courses/12/front_page": FakeResponse(text='{"url":"home","title":"Home","body":"<p>Welcome</p>","front_page":true}'),
             f"{ORIGIN}/api/v1/courses/12/discussion_topics": FakeResponse(text='[{"id":7,"title":"Hello","html_url":"%s/discussion_topics/7","message":"<p>Hi <a href=\\"/courses/12/files/5/download?verifier=s3cret\\">f</a></p>","posted_at":"2026-01-02T00:00:00Z","discussion_subentry_count":0,"attachments":[{"id":8,"display_name":"handout.pdf","content-type":"application/pdf","size":12}],"author":{"display_name":"A"}}]' % course),
-            f"{ORIGIN}/api/v1/courses/12/modules": FakeResponse(text='[{"id":1,"name":"Week 1","items":[{"id":11,"type":"File","title":"slides.pdf","content_id":5,"html_url":"%s/modules/items/11"},{"id":12,"type":"ExternalTool","title":"Kaltura clip","external_url":"https://aakaf.mivideo.it.umich.edu/x","html_url":"%s/modules/items/12"}]}]' % (course, course)),
+            f"{ORIGIN}/api/v1/courses/12/modules": FakeResponse(text='[{"id":1,"name":"Week 1","items_count":3,"items":[{"id":11,"type":"File","title":"slides.pdf","content_id":5,"html_url":"%s/modules/items/11"},{"id":12,"type":"ExternalTool","title":"Kaltura clip","external_url":"https://aakaf.mivideo.it.umich.edu/x","html_url":"%s/modules/items/12"},'
+                                                                     '{"id":13,"type":"ExternalUrl","title":"Syllabus doc","external_url":"https://docs.google.com/d","html_url":"%s/../../api/v1/courses/12/module_item_redirect/13"}]},'
+                                                                     '{"id":2,"name":"Hidden","items_count":1}]' % (course, course, course)),
+            f"{ORIGIN}/api/v1/courses/12/modules/2/items": FakeResponse(text='[{"id":21,"type":"Page","title":"Intro","page_url":"intro","html_url":"%s/modules/items/21"}]' % course),
+            f"{ORIGIN}/api/v1/courses/12/pages/intro": FakeResponse(text='{"url":"intro","title":"Intro","body":"<p>Hidden module page</p>"}'),
             f"{ORIGIN}/api/v1/courses/12/files": FakeResponse(text='[{"id":5,"display_name":"slides.pdf","content-type":"application/pdf","size":100,"folder_id":1},{"id":9,"display_name":"lecture.mp4","content-type":"video/mp4","size":5000000,"folder_id":1}]'),
             f"{ORIGIN}/api/v1/courses/12/folders": FakeResponse(text='[{"id":1,"full_name":"course files/Week 1","files_count":2}]'),
             f"{ORIGIN}/api/v1/courses/12/files/8": FakeResponse(text='{"id":8,"display_name":"handout.pdf","content-type":"application/pdf","size":12}'),
         }
         # Match list endpoints with query strings
         for path in list(responses):
-            if path.endswith(("/assignments", "/discussion_topics", "/modules", "/files", "/folders", "/pages", "/students/submissions", "/assignment_groups", "/quizzes")):
+            if path.endswith(("/assignments", "/discussion_topics", "/modules", "/files", "/folders", "/pages", "/students/submissions", "/assignment_groups", "/quizzes", "/items")):
                 responses[path + "*"] = responses[path]
 
         async def run():
@@ -125,6 +129,11 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(content.skipped_media[0][1], "Kaltura clip")
         self.assertIn(f"{course}/announcements", content.covered)
         self.assertNotIn(f"{course}/external_tools/1", content.browser_seeds)
+        # External items are covered by their course route, module anchors alias the Modules document,
+        # and items of a module whose items were not inlined are still listed and fetched.
+        self.assertIn(f"{course}/modules/items/13", content.covered)
+        self.assertEqual(content.aliases[f"{course}/modules/2"], f"{course}/modules")
+        self.assertTrue(any(doc.url == f"{course}/pages/intro" and "Hidden module page" in doc.html for doc in content.documents))
 
     def test_pagination_follows_link_header(self):
         responses = {
@@ -262,6 +271,8 @@ class PruneTests(unittest.TestCase):
             f"{ORIGIN}/courses/12/modules/items/5": "Old module item copy",
             f"{ORIGIN}/courses/12/pages/old-but-real": "Real text no longer linked",
             f"{ORIGIN}/courses/12/pages/fresh": "Fresh",
+            f"{ORIGIN}/courses/12/pages/fresh?note_id=3": "Old copy of fresh",
+            f"{ORIGIN}/courses/12/assignments/4/launch": "Home\nNew Quiz launch",
         }
         for url, text in rows.items():
             catalog.save_page(url=url, course_id="12", title="t", relative_path=f"courses/12/pages/{abs(hash(url))}.html", text=text)
@@ -269,7 +280,8 @@ class PruneTests(unittest.TestCase):
                                       covered={f"{ORIGIN}/courses/12/modules/items/5"})
         self.assertEqual(sorted(removed), sorted([
             f"{ORIGIN}/courses/12/discussion_topics/new", f"{ORIGIN}/courses/12/assignments/1",
-            f"{ORIGIN}/courses/12/modules/items/5",
+            f"{ORIGIN}/courses/12/modules/items/5", f"{ORIGIN}/courses/12/pages/fresh?note_id=3",
+            f"{ORIGIN}/courses/12/assignments/4/launch",
         ]))
         self.assertEqual(sorted(row["url"] for row in catalog.pages_for_course("12")),
                          [f"{ORIGIN}/courses/12/pages/fresh", f"{ORIGIN}/courses/12/pages/old-but-real"])

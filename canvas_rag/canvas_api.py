@@ -381,6 +381,17 @@ class CourseCollector:
         # Module items can point at content the list endpoints did not return (hidden Pages/Quizzes tabs).
         known_assignments = {str(a.get("id")) for a in assignments}
         for module in modules or []:
+            # Canvas may omit inline items for large modules; list them separately then.
+            if "items" not in module or (module.get("items_count") or 0) > len(module.get("items") or []):
+                items = await self._list(f"module:{module.get('id')}",
+                                         f"{self.base}/modules/{module.get('id')}/items?include[]=content_details&per_page=100")
+                if items is not None:
+                    module["items"] = items
+            if module.get("id"):
+                # /modules/<id> is an anchor into the Modules page, which the Modules document replaces.
+                module_url = self.course_url(f"/modules/{module['id']}")
+                self.content.covered.add(module_url)
+                self.content.aliases[module_url] = self.course_url("/modules")
             for item in module.get("items") or []:
                 await self._module_item(item, known_assignments, quiz_docs, assignments)
         for assignment in assignments:
@@ -562,7 +573,9 @@ class CourseCollector:
 
     async def _module_item(self, item: dict, known_assignments: set[str], quiz_docs: set[str], assignments: list) -> None:
         kind = item.get("type")
-        item_url = normalize_canvas_url(item["html_url"]) if item.get("html_url") else None
+        # External items carry an /api/v1/.../module_item_redirect/<id> html_url; the course
+        # route for every item is /modules/items/<id>.
+        item_url = self.course_url(f"/modules/items/{item['id']}") if item.get("id") else None
         if item_url:
             self.content.covered.add(item_url)
         target = None
@@ -647,7 +660,7 @@ class CourseCollector:
                 if kind == "SubHeader":
                     items.append(f"<li><strong>{title}</strong></li>")
                     continue
-                href = item.get("external_url") if kind == "ExternalUrl" else item.get("html_url")
+                href = item.get("external_url") if kind == "ExternalUrl" else self.course_url(f"/modules/items/{item.get('id')}")
                 extra = f" → {_esc(item.get('external_url'))}" if kind in {"ExternalUrl", "ExternalTool"} and item.get("external_url") else ""
                 items.append(f"<li>{_esc(kind)}: <a href=\"{html.escape(href or '', quote=True)}\">{title}</a>{extra}</li>")
             sections.append(f"<h2>{header}{' (' + _esc(', '.join(notes)) + ')' if notes else ''}</h2><ul>{''.join(items)}</ul>")

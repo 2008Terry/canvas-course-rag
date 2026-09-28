@@ -39,7 +39,8 @@ _JUNK_COURSE_PATH = re.compile(
         |/files/folder(?:/.*)?
         |/users/\d+(?:/.*)?
         |/pages/[^/]+/(?:revisions|edit)(?:/.*)?
-        |/assignments/\d+/(?:submissions|moderate|peer_reviews|edit|rubric)(?:/.*)?
+        |/assignments/\d+/(?:submissions|moderate|peer_reviews|edit|rubric|launch)(?:/.*)?
+        |/modules/items/\d+/launch(?:/.*)?
         |/quizzes/\d+/(?:take|history|submissions|statistics|moderate|edit|managed_quiz_data)(?:/.*)?
         |/.*/(?:new|edit)
         |/(?:new|edit)
@@ -634,11 +635,15 @@ def _prune_course_pages(catalog: Catalog, course_id: str, saved: set[str], cover
     old "Loading" shells. Other pages that were not seen this time are kept (the archive keeps
     content that has since disappeared from Canvas)."""
     stale = []
+    replaced = saved | covered
     for row in catalog.pages_for_course(course_id):
         url = row["url"]
         if url in saved:
             continue
-        if is_junk_course_url(url) or url in covered or looks_like_shell(row["text"]):
+        # A query variant (e.g. ?note_id=) of a page the API or this crawl now provides is an old copy.
+        without_query = urlunsplit(urlsplit(url)._replace(query=""))
+        if (is_junk_course_url(url) or url in covered or without_query in replaced
+                or looks_like_shell(row["text"])):
             stale.append(url)
     if stale:
         catalog.delete_pages(stale)
