@@ -44,6 +44,34 @@ class LocalVectorIndex:
             self.table.add(rows)
         return len(rows)
 
+    @staticmethod
+    def _quoted(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    def source_urls(self) -> set[str]:
+        if self.table is None:
+            return set()
+        return set(self.table.to_arrow().column("source_url").to_pylist())
+
+    def repair_sources(self, *, renamed: dict[str, str], valid: set[str]) -> tuple[int, int]:
+        """Point chunks at renamed catalog URLs and drop chunks whose source left the catalog."""
+        if self.table is None:
+            return 0, 0
+        present = self.source_urls()
+        moved = 0
+        for old, new in renamed.items():
+            if old in present:
+                self.table.delete(f"source_url = {self._quoted(new)}")
+                self.table.update(where=f"source_url = {self._quoted(old)}", values={"source_url": new})
+                present.discard(old)
+                present.add(new)
+                moved += 1
+        stale = sorted(present - valid)
+        for start in range(0, len(stale), 200):
+            batch = ", ".join(self._quoted(url) for url in stale[start:start + 200])
+            self.table.delete(f"source_url IN ({batch})")
+        return moved, len(stale)
+
     def search(self, query: str, *, limit: int = 8) -> list[dict]:
         if self.table is None:
             return []
