@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import json
+import os
+import posixpath
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit
+
+from .urls import canonical_attachment_url, normalize_canvas_url
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,24 @@ def safe_component(value: str, fallback: str = "item") -> str:
     return value[:80] or fallback
 
 
+def page_file_stem(url: str) -> str:
+    """File stem for a page snapshot; distinct normalized URLs always get distinct stems.
+
+    Plain wiki pages (``/courses/1/pages/<slug>`` without a query) keep the readable slug. Any
+    other URL, including pages that differ only by query string, gets a short hash of the URL.
+    """
+    parts = urlsplit(url)
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    match = re.search(r"/pages/([^/]+)$", parts.path)
+    if not match:
+        return digest[:12]
+    slug = match.group(1)
+    stem = safe_component(slug, "page")
+    if stem == slug and not parts.query:
+        return stem
+    return f"{stem[:60]}-{digest[:8]}"
+
+
 class _OfflineSanitizer(HTMLParser):
     DROP_CONTENT = {"script", "style", "iframe", "object", "embed", "form", "button"}
     VOID = {"area", "base", "br", "col", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
@@ -32,20 +55,6 @@ class _OfflineSanitizer(HTMLParser):
         self.source_url = source_url
         self.output: list[str] = []
         self.drop_depth = 0
-
-    @staticmethod
-    def _normalized(url: str) -> str:
-        parts = urlsplit(url)
-        query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
-                 if not key.lower().startswith("utm_") and key.lower() not in {
-                     "fbclid", "gclid", "token", "access_token", "signature", "sig", "credential",
-                     "auth", "authorization", "password", "session", "secret", "code", "ticket", "jwt",
-                 }]
-        host = parts.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        netloc = f"{host.lower()}:{parts.port}" if parts.port else host.lower()
-        return urlunsplit((parts.scheme.lower(), netloc, parts.path.rstrip("/"), urlencode(query), ""))
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -68,11 +77,16 @@ class _OfflineSanitizer(HTMLParser):
                 if lowered.startswith(("javascript:", "data:", "vbscript:")):
                     continue
                 absolute = urljoin(self.source_url, value)
-                local_value = self.local_targets.get(value) or self.local_targets.get(absolute) or self.local_targets.get(self._normalized(absolute))
+                normalized = normalize_canvas_url(absolute)
+                local_value = (
+                    self.local_targets.get(value) or self.local_targets.get(absolute)
+                    or self.local_targets.get(normalized)
+                    or self.local_targets.get(canonical_attachment_url(normalized) or "")
+                )
                 if local_value:
                     value = local_value
                 elif key == "href" and urlsplit(absolute).scheme in {"http", "https"}:
-                    value = self._normalized(absolute)
+                    value = normalized
                     safe_attrs.append(("target", "_blank"))
                     safe_attrs.append(("rel", "noopener noreferrer"))
                 elif key in {"src", "poster"}:
@@ -149,7 +163,40 @@ def write_course_index(root: Path, course_id: str, title: str, pages: list[dict]
         f'<li><a href="pages/{html.escape(Path(item["relative_path"]).name, quote=True)}">{html.escape(item["title"])}</a></li>'
         for item in pages
     )
-    (folder / "index.html").write_text(
+    _replace_file_text(
+        folder / "index.html",
         f'<!doctype html><meta charset="utf-8"><title>{html.escape(title)}</title>'
-        f'<h1>{html.escape(title)}</h1><ul>{links}</ul>', encoding="utf-8"
+        f'<h1>{html.escape(title)}</h1><ul>{links}</ul>',
     )
+
+
+def _replace_file_text(path: Path, text: str) -> None:
+    # Write a new file and swap it in, so a hard-linked copy of the archive is never modified in place.
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def relink_saved_pages(root: Path, moved: dict[str, str]) -> int:
+    """Point links in saved snapshots from merged duplicate files to the file that was kept."""
+    by_course: dict[str, dict[str, str]] = {}
+    for old, new in moved.items():
+        parts = Path(old).parts
+        if len(parts) >= 3 and parts[0] == "courses":
+            by_course.setdefault(parts[1], {})[old] = new
+    rewritten = 0
+    for course, mapping in by_course.items():
+        pages = Path("courses") / course / "pages"
+        replacements = {
+            f'"{posixpath.relpath(old, pages.as_posix())}"': f'"{posixpath.relpath(new, pages.as_posix())}"'
+            for old, new in mapping.items()
+        }
+        for path in sorted((root / pages).glob("*.html")):
+            text = path.read_text(encoding="utf-8")
+            updated = text
+            for old, new in replacements.items():
+                updated = updated.replace(old, new)
+            if updated != text:
+                _replace_file_text(path, updated)
+                rewritten += 1
+    return rewritten

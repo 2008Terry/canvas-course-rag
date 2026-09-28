@@ -2,9 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .urls import attachment_identity, normalize_canvas_url, redact_text, redact_url
+
+
+@dataclass
+class RepairReport:
+    renamed: dict[str, str] = field(default_factory=dict)
+    removed: list[str] = field(default_factory=list)
+    moved_files: dict[str, str] = field(default_factory=dict)
+    redacted_urls: int = 0
+    merged_pages: int = 0
+    merged_attachments: int = 0
+    shared_page_files: int = 0
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.renamed or self.removed)
 
 
 class Catalog:
@@ -60,6 +79,37 @@ class Catalog:
                     source_url TEXT PRIMARY KEY,
                     source_hash TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS sync_runs (
+                    run_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT,
+                    courses INTEGER NOT NULL DEFAULT 0,
+                    pages_captured INTEGER NOT NULL DEFAULT 0,
+                    pages_changed INTEGER NOT NULL DEFAULT 0,
+                    attachments INTEGER NOT NULL DEFAULT 0,
+                    failures INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS sync_failures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    course_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS sync_failures_by_run ON sync_failures(run_id);
+                CREATE TABLE IF NOT EXISTS sync_skipped (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    course_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS sync_skipped_by_run ON sync_skipped(run_id);
                 """
             )
 
@@ -73,10 +123,14 @@ class Catalog:
         return row is None or row["sha256"] != self.digest(fingerprint if fingerprint is not None else text)
 
     def save_page(self, *, url: str, course_id: str, title: str, relative_path: str, text: str, fingerprint: str | None = None) -> bool:
+        url = redact_url(url)
         digest = self.digest(fingerprint if fingerprint is not None else text)
         with self._database() as db:
-            row = db.execute("SELECT sha256 FROM pages WHERE url = ?", (url,)).fetchone()
+            row = db.execute("SELECT sha256, relative_path FROM pages WHERE url = ?", (url,)).fetchone()
             changed = row is None or row["sha256"] != digest
+            if row is not None and row["relative_path"] != relative_path:
+                # Search results carry the local path, so a moved snapshot is re-indexed.
+                db.execute("DELETE FROM index_status WHERE source_url=?", (url,))
             db.execute(
                 """INSERT INTO pages(url, course_id, title, relative_path, text, sha256, last_seen)
                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -92,6 +146,22 @@ class Catalog:
             rows = db.execute("SELECT * FROM pages WHERE course_id=? ORDER BY title, url", (course_id,))
             return [dict(row) for row in rows]
 
+    def delete_pages(self, urls) -> int:
+        """Remove page rows (and their index status) that no longer belong in the archive."""
+        urls = list(urls)
+        with self._database() as db:
+            for url in urls:
+                db.execute("DELETE FROM pages WHERE url=?", (url,))
+                db.execute("DELETE FROM index_status WHERE source_url=?", (url,))
+        return len(urls)
+
+    def delete_attachment(self, url: str) -> bool:
+        url = redact_url(url)
+        with self._database() as db:
+            removed = db.execute("DELETE FROM attachments WHERE url=?", (url,)).rowcount
+            db.execute("DELETE FROM index_status WHERE source_url=?", (url,))
+        return bool(removed)
+
     def all_pages(self) -> list[dict[str, Any]]:
         with self._database() as db:
             return [dict(row) for row in db.execute("SELECT * FROM pages ORDER BY course_id, title")]
@@ -101,9 +171,12 @@ class Catalog:
         extracted_text: str = "",
     ) -> bool:
         digest = sha256
+        url = redact_url(url)
         with self._database() as db:
-            old = db.execute("SELECT sha256 FROM attachments WHERE url=?", (url,)).fetchone()
+            old = db.execute("SELECT sha256, relative_path FROM attachments WHERE url=?", (url,)).fetchone()
             changed = old is None or old["sha256"] != digest
+            if old is not None and old["relative_path"] != relative_path:
+                db.execute("DELETE FROM index_status WHERE source_url=?", (url,))
             db.execute(
                 """INSERT INTO attachments(url, course_id, filename, relative_path, extracted_text, sha256, last_seen)
                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -150,3 +223,139 @@ class Catalog:
     def clear_index_status(self) -> None:
         with self._database() as db:
             db.execute("DELETE FROM index_status")
+
+    # Sync run bookkeeping -------------------------------------------------------------
+
+    def start_run(self, keep_runs: int = 20) -> str:
+        run_id = uuid.uuid4().hex
+        with self._database() as db:
+            db.execute("INSERT INTO sync_runs(run_id) VALUES (?)", (run_id,))
+            stale = [row["run_id"] for row in db.execute(
+                "SELECT run_id FROM sync_runs ORDER BY started_at DESC, rowid DESC LIMIT -1 OFFSET ?", (keep_runs,)
+            )]
+            for old in stale:
+                db.execute("DELETE FROM sync_failures WHERE run_id=?", (old,))
+                db.execute("DELETE FROM sync_skipped WHERE run_id=?", (old,))
+                db.execute("DELETE FROM sync_runs WHERE run_id=?", (old,))
+        return run_id
+
+    def record_failure(self, *, run_id: str, course_id: str, kind: str, url: str, reason: str) -> None:
+        with self._database() as db:
+            db.execute(
+                "INSERT INTO sync_failures(run_id, course_id, kind, url, reason) VALUES (?, ?, ?, ?, ?)",
+                (run_id, str(course_id), kind, redact_url(url), redact_text(reason)[:500]),
+            )
+
+    def record_skip(self, *, run_id: str, course_id: str, kind: str, url: str, reason: str, name: str = "") -> None:
+        """Content deliberately not downloaded (videos, locked or oversized files); not a failure."""
+        with self._database() as db:
+            db.execute(
+                "INSERT INTO sync_skipped(run_id, course_id, kind, url, name, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, str(course_id), kind, redact_url(url), name[:300], redact_text(reason)[:500]),
+            )
+
+    def skipped_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        with self._database() as db:
+            rows = db.execute("SELECT * FROM sync_skipped WHERE run_id=? ORDER BY id", (run_id,))
+            return [dict(row) for row in rows]
+
+    def finish_run(self, run_id: str, *, courses: int, pages_captured: int, pages_changed: int, attachments: int) -> None:
+        with self._database() as db:
+            db.execute(
+                """UPDATE sync_runs SET finished_at=CURRENT_TIMESTAMP, courses=?, pages_captured=?, pages_changed=?,
+                     attachments=?, failures=(SELECT COUNT(*) FROM sync_failures WHERE run_id=?)
+                   WHERE run_id=?""",
+                (courses, pages_captured, pages_changed, attachments, run_id, run_id),
+            )
+
+    def last_run(self) -> dict[str, Any] | None:
+        with self._database() as db:
+            row = db.execute("SELECT * FROM sync_runs ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def failures_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        with self._database() as db:
+            rows = db.execute("SELECT * FROM sync_failures WHERE run_id=? ORDER BY id", (run_id,))
+            return [dict(row) for row in rows]
+
+    # Migration of archives written by older versions ----------------------------------
+
+    def repair_needed(self) -> RepairReport:
+        """Report what `repair` would change without writing anything."""
+        return self.repair(dry_run=True)
+
+    def repair(self, *, root: Path | None = None, dry_run: bool = False) -> RepairReport:
+        """Redact credential query parameters and merge rows that refer to the same page or Canvas file.
+
+        Older versions stored ``?verifier=...`` URLs and one attachment row per link variant. The
+        surviving row of each group is renamed to the canonical URL; the index status follows it.
+        """
+        report = RepairReport()
+        db = self._connect()
+        try:
+            for table, key_for, merged_attr in (
+                ("pages", normalize_canvas_url, "merged_pages"),
+                ("attachments", attachment_identity, "merged_attachments"),
+            ):
+                groups: dict[str, list[dict[str, Any]]] = {}
+                for row in db.execute(f"SELECT url, relative_path, last_seen FROM {table} ORDER BY last_seen DESC, url"):
+                    groups.setdefault(key_for(row["url"]), []).append(dict(row))
+                for canonical, rows in groups.items():
+                    def rank(row, canonical=canonical):
+                        on_disk = root is not None and (Path(root) / row["relative_path"]).is_file()
+                        return (row["url"] != canonical, not on_disk)
+                    keeper, *duplicates = sorted(rows, key=rank)
+                    for row in duplicates:
+                        db.execute(f"DELETE FROM {table} WHERE url=?", (row["url"],))
+                        report.removed.append(row["url"])
+                        if row["relative_path"] != keeper["relative_path"]:
+                            report.moved_files[row["relative_path"]] = keeper["relative_path"]
+                    setattr(report, merged_attr, getattr(report, merged_attr) + len(duplicates))
+                    if keeper["url"] != canonical:
+                        db.execute(f"UPDATE {table} SET url=? WHERE url=?", (canonical, keeper["url"]))
+                        report.renamed[keeper["url"]] = canonical
+            for table in ("sync_failures", "sync_skipped"):
+                for row in db.execute(f"SELECT url FROM {table}").fetchall():
+                    if redact_url(row["url"]) != row["url"]:
+                        db.execute(f"UPDATE {table} SET url=? WHERE url=?", (redact_url(row["url"]), row["url"]))
+            report.redacted_urls = sum(1 for old in [*report.renamed, *report.removed] if redact_url(old) != old)
+            for old in report.removed:
+                db.execute("DELETE FROM index_status WHERE source_url=?", (old,))
+            for old, new in report.renamed.items():
+                status = db.execute("SELECT source_hash FROM index_status WHERE source_url=?", (old,)).fetchone()
+                db.execute("DELETE FROM index_status WHERE source_url IN (?, ?)", (old, new))
+                if status:
+                    db.execute("INSERT INTO index_status(source_url, source_hash) VALUES (?, ?)", (new, status["source_hash"]))
+            db.execute(
+                """DELETE FROM index_status WHERE source_url NOT IN (SELECT url FROM pages)
+                   AND source_url NOT IN (SELECT url FROM attachments)"""
+            )
+            report.shared_page_files = db.execute(
+                "SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM pages GROUP BY relative_path HAVING n > 1)"
+            ).fetchone()[0]
+            if dry_run:
+                db.rollback()
+            else:
+                db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        return report
+
+    def source_urls(self) -> set[str]:
+        with self._database() as db:
+            return {row["url"] for row in db.execute("SELECT url FROM pages UNION SELECT url FROM attachments")}
+
+    def referenced_files(self) -> set[str]:
+        """Archive-relative paths the catalog points at (snapshots, sidecars, attachments)."""
+        paths: set[str] = set()
+        with self._database() as db:
+            for row in db.execute("SELECT relative_path FROM pages"):
+                paths.add(row["relative_path"])
+                paths.add(str(Path(row["relative_path"]).with_suffix(".md").as_posix()))
+            for row in db.execute("SELECT relative_path FROM attachments"):
+                paths.add(row["relative_path"])
+                paths.add(row["relative_path"] + ".md")
+        return paths
