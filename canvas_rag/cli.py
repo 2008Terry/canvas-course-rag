@@ -12,7 +12,7 @@ from pathlib import Path
 from .archive import relink_saved_pages, write_course_index
 from .browser import BrowserConnectionError, SyncSummary, sync_canvas
 from .catalog import Catalog
-from .index import LocalVectorIndex, rebuild_index
+from .index import IndexBusyError, LocalVectorIndex, index_writer_lock, maintain_index, rebuild_index
 from .urls import redact_url
 
 logger = logging.getLogger("canvas_rag")
@@ -101,7 +101,15 @@ def _sync_and_index(root: Path, catalog: Catalog, cdp_url: str, only_course: str
     summary = asyncio.run(sync_canvas(root=root, catalog=catalog, cdp_url=cdp_url, only_course=only_course))
     logger.info("Updating the local search index")
     index = LocalVectorIndex(root / "vectors")
-    indexed = rebuild_index(catalog, index)
+    try:
+        with index_writer_lock(root / "vectors"):
+            indexed = rebuild_index(catalog, index)
+            compacted = maintain_index(index, wrote=indexed > 0)
+            if compacted:
+                logger.info("Compacted the search index (%d versions -> %d)", *compacted)
+    except IndexBusyError as exc:
+        logger.warning("%s Indexing without compaction.", exc)
+        indexed = rebuild_index(catalog, index)
     _print_summary(summary)
     print(f"Indexed text chunks: {indexed}")
     print(f"Archive: {root}")
@@ -127,6 +135,17 @@ def _status(root: Path, catalog: Catalog, show_failures: bool) -> int:
 
 
 def _repair(root: Path, catalog: Catalog, dry_run: bool, prune_files: bool) -> int:
+    if dry_run:
+        return _repair_locked(root, catalog, dry_run, prune_files)
+    try:
+        with index_writer_lock(root / "vectors"):
+            return _repair_locked(root, catalog, dry_run, prune_files)
+    except IndexBusyError as exc:
+        print(f"Repair not started: {exc}")
+        return 2
+
+
+def _repair_locked(root: Path, catalog: Catalog, dry_run: bool, prune_files: bool) -> int:
     report = catalog.repair(root=root, dry_run=dry_run)
     verb = "Would" if dry_run else "Did"
     print(f"{verb} redact access tokens from {report.redacted_urls} stored URL(s)")
@@ -138,11 +157,23 @@ def _repair(root: Path, catalog: Catalog, dry_run: bool, prune_files: bool) -> i
             title = re.search(r"<title>(.*?)</title>", index_path.read_text(encoding="utf-8"), re.S) if index_path.is_file() else None
             if title:
                 write_course_index(root, course_id, html.unescape(title.group(1)), catalog.pages_for_course(course_id))
-    if not dry_run and report.changed and (root / "vectors").exists():
+    if not dry_run and (root / "vectors" / "canvas_chunks.lance").exists():
         try:
             index = LocalVectorIndex(root / "vectors")
-            moved, dropped = index.repair_sources(renamed=report.renamed, valid=catalog.source_urls())
-            print(f"Search index: renamed {moved} source(s), removed chunks of {dropped} stale source(s)")
+            modified = False
+            if report.changed:
+                moved, dropped = index.repair_sources(renamed=report.renamed, valid=catalog.source_urls())
+                modified = bool(moved or dropped)
+                print(f"Search index: renamed {moved} source(s), removed chunks of {dropped} stale source(s)")
+            # Old table versions still hold the pre-repair rows (and their tokens) until they are cleaned up.
+            if modified or index.token_residue():
+                before, after = index.compact(remove_unverified=True)
+                print(f"Search index: compacted and removed old versions ({before} -> {after})")
+            residue = index.token_residue()
+            if residue:
+                print(f"warning: {residue} search-index file(s) still contain `verifier=` or `access_token=` "
+                      "(possibly course text that quotes such a link). To rebuild the index from scratch, "
+                      f"delete `{root / 'vectors'}` and run `course-rag sync`.")
         except RuntimeError as exc:
             print(f"Search index not updated ({exc}). Delete `{root / 'vectors'}` and run `course-rag sync` to rebuild it.")
     referenced = catalog.referenced_files() if not dry_run else _referenced_after_repair(catalog, root)
