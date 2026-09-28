@@ -1,8 +1,14 @@
 # Canvas Course Mirror
 
-A standalone, local-first course archive and semantic search tool. It does not use or modify `canvas-mcp`, and it does not call Canvas's API. It reads pages available to your signed-in Canvas browser, saves static HTML and downloaded attachments locally, and builds a local LanceDB index using `intfloat/multilingual-e5-small`.
+A standalone, local-first course archive and semantic search tool. It does not use or modify `canvas-mcp`. It reads what your signed-in Canvas browser can see, saves static HTML and downloaded attachments locally, and builds a local LanceDB index using `intfloat/multilingual-e5-small`.
 
-The archive contains the page snapshot, a Markdown text sidecar, native downloaded attachments, extracted document text where supported, a SQLite catalog, and local vector data. Discussions, Grades, People, Assignments, Modules, Files, Pages, and other visible same-course links are discovered from the course UI. The crawler stays within the course URL and stops before Canvas API routes, assignment submission pages, and quiz-taking pages.
+The archive contains the page snapshot, a Markdown text sidecar, native downloaded attachments, extracted document text where supported, a SQLite catalog, and local vector data.
+
+**How content is found.** For each course the collector first reads Canvas's REST API through the signed-in browser session (GET requests only, the same session the browser uses; no API token is created or stored): modules and their items (including modules whose tab is hidden), assignments with descriptions, rubrics and your own submission/score/comments, announcements and discussions with full messages and replies, wiki pages, classic-quiz intro pages, the syllabus, and course files/folders where you are allowed to list them (a 403 is fine; files linked from content are still found). Each item becomes a document with real text, and every `/files/<id>` link inside those bodies is downloaded. The browser crawl then supplements this with the course home, Grades, People and any same-course page the API does not describe. Announcements and discussions are read only from the API list endpoints, which do not mark them read; the browser never opens them.
+
+**Page capture.** Each page waits for network idle and for Canvas's content area to show real text (no "Loading" placeholder or spinner), and a page that is still empty is reloaded once with longer waits; a page that stays empty is recorded as a failure instead of being saved. Text comes from `#content` (then `role=main`, `main`) with navigation and hidden elements removed, so the course menu is not prepended to every page. The crawler stays within the course, stops before Canvas API routes, assignment submission pages and quiz-taking pages, and skips noise such as `…/new` and `…/edit` forms, `?view=notifications`, calendar, settings, notebook, collaborations/conferences and LTI tool launches (Gradescope, Kaltura/Media Gallery, …).
+
+**Videos are skipped.** Files whose content type is `video/*` or `audio/*`, or whose name ends in `.mp4`, `.mov`, `.m4v`, `.webm`, `.avi`, `.mkv` (or another media extension), and Kaltura/Media Gallery items are never downloaded. When no metadata is available the download follows Canvas's redirects one hop at a time and stops as soon as the storage URL names a media file, so no video bytes are fetched. Skipped items are recorded in the catalog as *skipped*, not failures (`course-rag status --skipped`). Other downloads are retried on network errors and 429/5xx answers; every file that still cannot be saved is recorded with its reason.
 
 ## Install
 
@@ -41,6 +47,7 @@ course-rag query "What are the grading criteria for the final project?"
 course-rag query --no-sync "Summarize the Week 4 lecture notes"
 course-rag status
 course-rag status --failures
+course-rag status --skipped
 course-rag repair --dry-run
 ```
 
@@ -52,7 +59,9 @@ While syncing, progress (per course, page counts, attachment downloads) and a wa
 
 Each Canvas file is downloaded and indexed once per course, however many routes link to it (`/files/123`, `/files/123/download?download_frd=1`, `/files/123/preview`, `?verifier=...`). Its catalog URL is the canonical `https://<canvas>/courses/<course>/files/<file id>`. Page snapshots are named after the wiki page slug; any other URL, or a page URL with a distinguishing query such as `?note_id=`, gets a short hash of the URL so distinct pages never overwrite each other. Canvas's `module_item_id` navigation parameter is ignored, so a page reached from Modules is the same page.
 
-The `query` command syncs by default. If Edge is disconnected or Canvas has signed out, it reports that and leaves the saved archive available for offline search. The current crawler caps each course at 1,000 same-course pages per run. Files linked as downloads are saved in their native format; common PDF, Word, PowerPoint, Excel, and text formats are extracted. External video/streaming media stay as links and are not downloaded or transcribed.
+After a course is synced, catalog rows the sync has replaced are removed: junk URLs, module-item and list URLs now served by an API document, and old "Loading" shell pages. Other pages that were not seen again are kept, so content that disappears from Canvas stays in the archive. Their files are removed by `course-rag repair --prune-files`.
+
+The `query` command syncs by default. If Edge is disconnected or Canvas has signed out, it reports that and leaves the saved archive available for offline search. The current crawler caps each course at 1,000 same-course pages per run. Files linked as downloads are saved in their native format; common PDF, Word, PowerPoint, Excel, and text formats are extracted. Videos and audio recordings (Canvas files or external streaming media) are not downloaded or transcribed; they appear by name in each course's Files document and as links.
 
 ## Upgrading an existing archive
 

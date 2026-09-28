@@ -99,6 +99,17 @@ class Catalog:
                     recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS sync_failures_by_run ON sync_failures(run_id);
+                CREATE TABLE IF NOT EXISTS sync_skipped (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    course_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS sync_skipped_by_run ON sync_skipped(run_id);
                 """
             )
 
@@ -134,6 +145,22 @@ class Catalog:
         with self._database() as db:
             rows = db.execute("SELECT * FROM pages WHERE course_id=? ORDER BY title, url", (course_id,))
             return [dict(row) for row in rows]
+
+    def delete_pages(self, urls) -> int:
+        """Remove page rows (and their index status) that no longer belong in the archive."""
+        urls = list(urls)
+        with self._database() as db:
+            for url in urls:
+                db.execute("DELETE FROM pages WHERE url=?", (url,))
+                db.execute("DELETE FROM index_status WHERE source_url=?", (url,))
+        return len(urls)
+
+    def delete_attachment(self, url: str) -> bool:
+        url = redact_url(url)
+        with self._database() as db:
+            removed = db.execute("DELETE FROM attachments WHERE url=?", (url,)).rowcount
+            db.execute("DELETE FROM index_status WHERE source_url=?", (url,))
+        return bool(removed)
 
     def all_pages(self) -> list[dict[str, Any]]:
         with self._database() as db:
@@ -208,6 +235,7 @@ class Catalog:
             )]
             for old in stale:
                 db.execute("DELETE FROM sync_failures WHERE run_id=?", (old,))
+                db.execute("DELETE FROM sync_skipped WHERE run_id=?", (old,))
                 db.execute("DELETE FROM sync_runs WHERE run_id=?", (old,))
         return run_id
 
@@ -217,6 +245,19 @@ class Catalog:
                 "INSERT INTO sync_failures(run_id, course_id, kind, url, reason) VALUES (?, ?, ?, ?, ?)",
                 (run_id, str(course_id), kind, redact_url(url), redact_text(reason)[:500]),
             )
+
+    def record_skip(self, *, run_id: str, course_id: str, kind: str, url: str, reason: str, name: str = "") -> None:
+        """Content deliberately not downloaded (videos, locked or oversized files); not a failure."""
+        with self._database() as db:
+            db.execute(
+                "INSERT INTO sync_skipped(run_id, course_id, kind, url, name, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, str(course_id), kind, redact_url(url), name[:300], redact_text(reason)[:500]),
+            )
+
+    def skipped_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        with self._database() as db:
+            rows = db.execute("SELECT * FROM sync_skipped WHERE run_id=? ORDER BY id", (run_id,))
+            return [dict(row) for row in rows]
 
     def finish_run(self, run_id: str, *, courses: int, pages_captured: int, pages_changed: int, attachments: int) -> None:
         with self._database() as db:
@@ -273,9 +314,10 @@ class Catalog:
                     if keeper["url"] != canonical:
                         db.execute(f"UPDATE {table} SET url=? WHERE url=?", (canonical, keeper["url"]))
                         report.renamed[keeper["url"]] = canonical
-            for row in db.execute("SELECT url FROM sync_failures"):
-                if redact_url(row["url"]) != row["url"]:
-                    db.execute("UPDATE sync_failures SET url=? WHERE url=?", (redact_url(row["url"]), row["url"]))
+            for table in ("sync_failures", "sync_skipped"):
+                for row in db.execute(f"SELECT url FROM {table}").fetchall():
+                    if redact_url(row["url"]) != row["url"]:
+                        db.execute(f"UPDATE {table} SET url=? WHERE url=?", (redact_url(row["url"]), row["url"]))
             report.redacted_urls = sum(1 for old in [*report.renamed, *report.removed] if redact_url(old) != old)
             for old in report.removed:
                 db.execute("DELETE FROM index_status WHERE source_url=?", (old,))

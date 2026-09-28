@@ -54,7 +54,8 @@ def _parser() -> argparse.ArgumentParser:
     query.add_argument("--cdp-url", default="http://127.0.0.1:9222")
     query.add_argument("--no-sync", action="store_true", help="Search the current local index without syncing")
     status = commands.add_parser("status", help="Show local page and attachment counts and the last sync's skipped URLs")
-    status.add_argument("--failures", action="store_true", help="List every URL skipped by the last sync")
+    status.add_argument("--failures", action="store_true", help="List every URL that failed in the last sync")
+    status.add_argument("--skipped", action="store_true", help="List content the last sync deliberately skipped (videos, locked files)")
     repair = commands.add_parser("repair", help="Migrate an archive made by an older version (redact tokens, merge duplicates)")
     repair.add_argument("--dry-run", action="store_true", help="Report what would change without writing anything")
     repair.add_argument("--prune-files", action="store_true", help="Also delete page and attachment files the catalog no longer references")
@@ -86,12 +87,22 @@ def _print_failures(failures, limit: int | None = None) -> None:
         print(f"  ... and {len(failures) - len(shown)} more (see `course-rag status --failures`)")
 
 
+def _skip_counts(skipped) -> str:
+    counts: dict[str, int] = {}
+    for item in skipped:
+        kind = item["kind"] if isinstance(item, dict) else item.kind
+        counts[kind] = counts.get(kind, 0) + 1
+    return ", ".join(f"{count} {kind}" for kind, count in sorted(counts.items()))
+
+
 def _print_summary(summary: SyncSummary) -> None:
     print(f"Courses synced: {summary.courses}")
-    print(f"Pages captured: {summary.pages_captured}")
+    print(f"Pages captured: {summary.pages_captured} ({summary.api_documents} from the Canvas API)")
     print(f"Updated pages: {summary.pages_changed}")
     print(f"Attachments downloaded: {summary.attachments}")
-    print(f"Skipped or failed URLs: {len(summary.failures)}")
+    if summary.skipped:
+        print(f"Deliberately skipped (not failures): {_skip_counts(summary.skipped)}")
+    print(f"Failed URLs: {len(summary.failures)}")
     _print_failures(summary.failures, limit=20)
     if summary.empty_courses:
         print(f"Courses with no captured pages (rerun with --course): {', '.join(summary.empty_courses)}")
@@ -104,7 +115,11 @@ def _sync_and_index(root: Path, catalog: Catalog, cdp_url: str, only_course: str
     try:
         with index_writer_lock(root / "vectors"):
             indexed = rebuild_index(catalog, index)
-            compacted = maintain_index(index, wrote=indexed > 0)
+            # Chunks of pages the sync removed from the catalog (junk URLs, replaced shells).
+            _, dropped = index.repair_sources(renamed={}, valid=catalog.source_urls())
+            if dropped:
+                logger.info("Removed search-index chunks of %d page(s) no longer in the archive", dropped)
+            compacted = maintain_index(index, wrote=indexed > 0 or dropped > 0)
             if compacted:
                 logger.info("Compacted the search index (%d versions -> %d)", *compacted)
     except IndexBusyError as exc:
@@ -116,15 +131,23 @@ def _sync_and_index(root: Path, catalog: Catalog, cdp_url: str, only_course: str
     return summary.pages_changed, index
 
 
-def _status(root: Path, catalog: Catalog, show_failures: bool) -> int:
+def _status(root: Path, catalog: Catalog, show_failures: bool, show_skipped: bool = False) -> int:
     print(f"Pages: {len(catalog.all_pages())}")
     print(f"Attachments: {len(catalog.all_attachments())}")
     run = catalog.last_run()
     if run:
         failures = catalog.failures_for_run(run["run_id"])
         state = "finished" if run["finished_at"] else "did not finish"
+        skipped = catalog.skipped_for_run(run["run_id"])
         print(f"Last sync: started {run['started_at']} UTC ({state}), {run['pages_captured']} pages, "
-              f"{run['attachments']} attachments, {len(failures)} skipped")
+              f"{run['attachments']} attachments, {len(failures)} skipped because of errors")
+        if skipped:
+            print(f"Deliberately skipped (not failures): {_skip_counts(skipped)}"
+                  + ("" if show_skipped else " (see `course-rag status --skipped`)"))
+            if show_skipped:
+                for item in skipped:
+                    name = f"{item['name']} " if item["name"] else ""
+                    print(f"  - [{item['course_id']}] {item['kind']} {name}{redact_url(item['url'])}: {item['reason']}")
         _print_failures(failures, limit=None if show_failures else 10)
     pending = catalog.repair_needed()
     if pending.changed:
@@ -224,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     root.mkdir(parents=True, exist_ok=True)
     catalog = Catalog(root / "catalog.sqlite3")
     if args.command == "status":
-        return _status(root, catalog, args.failures)
+        return _status(root, catalog, args.failures, args.skipped)
     if args.command == "repair":
         return _repair(root, catalog, args.dry_run, args.prune_files)
     if args.command == "sync":

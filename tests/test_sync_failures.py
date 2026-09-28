@@ -35,8 +35,15 @@ class FakePage:
     async def wait_for_timeout(self, ms):
         return None
 
+    async def wait_for_load_state(self, state, timeout=None):
+        return None
+
+    async def wait_for_function(self, expression, timeout=None, polling=None):
+        return None
+
     async def evaluate(self, script):
-        return self.states[self.url]
+        state = self.states[self.url]
+        return {**state, "loading": False}
 
 
 class FakeContext:
@@ -66,11 +73,18 @@ class FakeResponse:
 
 
 class FakeRequest:
+    """Canvas API calls (/api/v1/) are answered with 404 unless listed; they are tracked separately
+    from page/file requests."""
+
     def __init__(self, responses):
         self.responses = responses
         self.requested = []
+        self.api_requested = []
 
-    async def get(self, url, timeout=None):
+    async def get(self, url, timeout=None, **kwargs):
+        if "/api/v1/" in url:
+            self.api_requested.append(url)
+            return self.responses.get(url, FakeResponse(status=404, url=url))
         self.requested.append(url)
         return self.responses[url]
 
